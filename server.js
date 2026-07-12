@@ -1,7 +1,6 @@
 /**
  * Local development entry point.
- * Loads .env and starts the Express app from functions/app.js.
- * In production, Firebase Cloud Functions uses functions/index.js instead.
+ * Production: Firebase Cloud Functions (functions/index.js)
  */
 'use strict';
 

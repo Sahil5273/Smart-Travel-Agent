@@ -1,617 +1,545 @@
 /**
- * Smart Travel & Route Optimization Agent — Express Backend
- *
- * Designed for deployment on Firebase Cloud Functions. All route handlers
- * are async; Firestore is the single source of truth for agent state.
- *
- * Required environment variables:
- *   GEMINI_API_KEY          — Google Gemini API key
- *   GEMINI_ENABLED          — set to "false" to disable LLM calls (default: true)
- *   GEMINI_MODEL            — defaults to gemini-2.0-flash-lite (higher free-tier headroom)
- *   GOOGLE_APPLICATION_CREDENTIALS (local dev) — path to service-account JSON
- *   PORT                    — optional, defaults to 3001
+ * Smart Travel Agent — Agentic Express Backend
+ * Gemini structured outputs + native function calling + Firestore state machine
  */
-
 'use strict';
 
 const express = require('express');
 const cors = require('cors');
 const { initializeApp, getApps } = require('firebase-admin/app');
 const { getFirestore, FieldValue } = require('firebase-admin/firestore');
-const { GoogleGenAI } = require('@google/genai');
-
-// ---------------------------------------------------------------------------
-// 1. Setup & Ingestion
-// ---------------------------------------------------------------------------
+const { GoogleGenAI, FunctionCallingConfigMode } = require('@google/genai');
 
 const app = express();
-
 app.use(cors());
 app.use(express.json());
 
-// Firebase Admin — on Cloud Functions, credentials are injected automatically.
-if (!getApps().length) {
-  initializeApp();
-}
+if (!getApps().length) initializeApp();
 const db = getFirestore();
 
-// Google Gen AI (Gemini) — only used once per session on /respond to enrich the final plan.
 const GEMINI_ENABLED = process.env.GEMINI_ENABLED !== 'false';
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash-lite';
-const GEMINI_MAX_OUTPUT_TOKENS = 200;
-const GEMINI_COOLDOWN_MS = 5 * 60 * 1000; // pause calls for 5 min after quota errors
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+const SESSIONS_COLLECTION = 'sessions';
 
 const genAI =
   GEMINI_ENABLED && process.env.GEMINI_API_KEY
     ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
     : null;
 
-/** @type {Map<string, object>} In-memory cache: "goal|choice" → enrichment */
-const geminiPlanCache = new Map();
-let geminiCooldownUntil = 0;
+// ---------------------------------------------------------------------------
+// JSON Schemas
+// ---------------------------------------------------------------------------
 
-// Firestore collection / field conventions
-const SESSIONS_COLLECTION = 'sessions';
+const TRIP_PARAMS_SCHEMA = {
+  type: 'object',
+  properties: {
+    origin: { type: 'string', description: 'Departure city' },
+    destination: { type: 'string', description: 'Arrival city' },
+    budget: { type: 'number', description: 'Total budget in INR' },
+    durationDays: { type: 'number', description: 'Trip length in days' },
+  },
+  required: ['origin', 'destination', 'budget', 'durationDays'],
+};
 
-/** @typedef {'RUNNING' | 'AWAITING_USER_INPUT' | 'COMPLETED' | 'ERROR'} SessionStatus */
+const FINAL_ITINERARY_SCHEMA = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string' },
+    origin: { type: 'string' },
+    destination: { type: 'string' },
+    estimatedCostINR: { type: 'number' },
+    durationDays: { type: 'number' },
+    transitLogistics: {
+      type: 'object',
+      properties: {
+        mode: { type: 'string' },
+        route: { type: 'string' },
+        distanceKm: { type: 'number' },
+        durationHours: { type: 'number' },
+        estimatedCostINR: { type: 'number' },
+        details: { type: 'string' },
+      },
+      required: ['mode', 'route', 'distanceKm', 'durationHours', 'estimatedCostINR', 'details'],
+    },
+    dailyItinerary: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          day: { type: 'number' },
+          morning: { type: 'array', items: { type: 'string' } },
+          afternoon: { type: 'array', items: { type: 'string' } },
+          evening: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['day', 'morning', 'afternoon', 'evening'],
+      },
+    },
+    localTransport: { type: 'array', items: { type: 'string' } },
+    weatherPackingList: { type: 'array', items: { type: 'string' } },
+  },
+  required: [
+    'summary', 'origin', 'destination', 'estimatedCostINR', 'durationDays',
+    'transitLogistics', 'dailyItinerary', 'localTransport', 'weatherPackingList',
+  ],
+};
 
-/**
- * @typedef {object} AgentLogEntry
- * @property {string} timestamp
- * @property {'thought' | 'action' | 'observation' | 'user_input' | 'system'} type
- * @property {string} message
- */
-
-/**
- * @typedef {object} PendingOption
- * @property {string} id
- * @property {string} label
- * @property {string} description
- * @property {Record<string, unknown>} [metadata]
- */
-
-/**
- * @typedef {object} SessionState
- * @property {string} sessionId
- * @property {string} userId
- * @property {string} userGoal
- * @property {SessionStatus} status
- * @property {AgentLogEntry[]} logs
- * @property {AgentLogEntry[]} history
- * @property {PendingOption[] | null} pendingOptions
- * @property {string | null} conflictReason
- * @property {object | null} finalPlan
- * @property {FirebaseFirestore.Timestamp} createdAt
- * @property {FirebaseFirestore.Timestamp} updatedAt
- */
+const TOOL_DECLARATIONS = [
+  {
+    name: 'get_transit_route',
+    description: 'Returns point-to-point transit logistics between origin and destination.',
+    parameters: {
+      type: 'OBJECT',
+      properties: {
+        origin: { type: 'STRING', description: 'Departure city' },
+        destination: { type: 'STRING', description: 'Arrival city' },
+      },
+      required: ['origin', 'destination'],
+    },
+  },
+  {
+    name: 'get_attractions',
+    description: 'Returns local points of interest for a city.',
+    parameters: {
+      type: 'OBJECT',
+      properties: {
+        city: { type: 'STRING', description: 'City name' },
+      },
+      required: ['city'],
+    },
+  },
+  {
+    name: 'calculate_total_cost',
+    description: 'Evaluates combined transit, lodging, food, and activity costs.',
+    parameters: {
+      type: 'OBJECT',
+      properties: {
+        tier: {
+          type: 'STRING',
+          description: 'Cost tier: budget, balanced, or premium',
+          enum: ['budget', 'balanced', 'premium'],
+        },
+      },
+      required: ['tier'],
+    },
+  },
+];
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Travel knowledge base (tool backends)
+// ---------------------------------------------------------------------------
+
+const CITY_COORDS = {
+  delhi: [28.6139, 77.209],
+  mumbai: [19.076, 72.8777],
+  jaipur: [26.9124, 75.7873],
+  udaipur: [24.5854, 73.7125],
+  goa: [15.2993, 74.124],
+  manali: [32.2432, 77.1892],
+  bangalore: [12.9716, 77.5946],
+  chennai: [13.0827, 80.2707],
+  kolkata: [22.5726, 88.3639],
+  hyderabad: [17.385, 78.4867],
+  agra: [27.1767, 78.0081],
+  amritsar: [31.634, 74.8723],
+};
+
+const ATTRACTIONS_DB = {
+  jaipur: ['Amber Fort', 'City Palace', 'Hawa Mahal', 'Jantar Mantar', 'Nahargarh Fort'],
+  udaipur: ['City Palace', 'Lake Pichola', 'Jagdish Temple', 'Monsoon Palace', 'Fateh Sagar'],
+  delhi: ['Red Fort', 'India Gate', 'Qutub Minar', 'Humayun Tomb', 'Chandni Chowk'],
+  mumbai: ['Gateway of India', 'Marine Drive', 'Elephanta Caves', 'Colaba Causeway'],
+  goa: ['Baga Beach', 'Fort Aguada', 'Basilica of Bom Jesus', 'Dudhsagar Falls'],
+  manali: ['Solang Valley', 'Hadimba Temple', 'Rohtang Pass', 'Old Manali'],
+  agra: ['Taj Mahal', 'Agra Fort', 'Mehtab Bagh'],
+  bangalore: ['Lalbagh', 'Cubbon Park', 'Bangalore Palace', 'ISKCON Temple'],
+};
+
+function normalizeCity(name) {
+  return String(name || '').toLowerCase().trim().replace(/,.*/, '');
+}
+
+function haversineKm(a, b) {
+  const [lat1, lon1] = a;
+  const [lat2, lon2] = b;
+  const R = 6371;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const x =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
+}
+
+function estimateDistanceKm(origin, destination) {
+  const o = normalizeCity(origin);
+  const d = normalizeCity(destination);
+  if (CITY_COORDS[o] && CITY_COORDS[d]) return haversineKm(CITY_COORDS[o], CITY_COORDS[d]);
+  if (o === d) return 25;
+  return 450;
+}
+
+function toolGetTransitRoute(origin, destination) {
+  const distanceKm = Math.round(estimateDistanceKm(origin, destination));
+  let mode, route, durationHours, estimatedCostINR, details;
+
+  if (distanceKm <= 350) {
+    mode = 'Road';
+    route = distanceKm > 200 ? 'NH48 / NH52 expressway corridor' : 'State highway + ring road';
+    durationHours = Math.round((distanceKm / 65) * 10) / 10;
+    estimatedCostINR = Math.round(distanceKm * 4 + 600);
+    details = `Drive or AC Volvo bus from ${origin} to ${destination} via ${route}. Approx ${distanceKm} km, ${durationHours}h.`;
+  } else if (distanceKm <= 900) {
+    mode = 'Train';
+    route = 'Vande Bharat Express / Rajdhani';
+    durationHours = Math.round((distanceKm / 85 + 2) * 10) / 10;
+    estimatedCostINR = Math.round(1800 + distanceKm * 2.2);
+    details = `Board Vande Bharat Express from ${origin} to ${destination}. Scenic rail corridor, ${durationHours}h journey.`;
+  } else {
+    mode = 'Flight';
+    route = `Direct or 1-stop flight ${origin} → ${destination}`;
+    durationHours = Math.round((2.5 + distanceKm / 600) * 10) / 10;
+    estimatedCostINR = Math.round(5000 + distanceKm * 1.8);
+    details = `Fly from ${origin} airport to ${destination} airport. Check-in 2h before departure.`;
+  }
+
+  return { origin, destination, mode, route, distanceKm, durationHours, estimatedCostINR, details };
+}
+
+function toolGetAttractions(city) {
+  const key = normalizeCity(city);
+  const attractions = ATTRACTIONS_DB[key] || [
+    `${city} heritage walk`,
+    `${city} central market`,
+    `${city} viewpoint`,
+    `${city} local museum`,
+  ];
+  return { city, attractions, count: attractions.length };
+}
+
+function toolCalculateTotalCost(agentContext, tripParams, tier = 'balanced') {
+  const transit = agentContext.transitRoute?.estimatedCostINR || 0;
+  const mult = tier === 'budget' ? 0.75 : tier === 'premium' ? 1.35 : 1;
+  const lodging = Math.round(tripParams.durationDays * 2800 * mult);
+  const activities = Math.round(tripParams.durationDays * 1800 * mult);
+  const food = Math.round(tripParams.durationDays * 900 * mult);
+  const total = Math.round(transit + lodging + activities + food);
+
+  agentContext.costBreakdown = { tier, transit, lodging, activities, food, total };
+  agentContext.totalCost = total;
+  agentContext.tier = tier;
+  return agentContext.costBreakdown;
+}
+
+function executeTool(name, args, agentContext, tripParams) {
+  if (name === 'get_transit_route') {
+    const result = toolGetTransitRoute(args.origin, args.destination);
+    agentContext.transitRoute = result;
+    agentContext.transitHours = result.durationHours;
+    return result;
+  }
+  if (name === 'get_attractions') {
+    const result = toolGetAttractions(args.city);
+    agentContext.attractions[args.city] = result.attractions;
+    return result;
+  }
+  if (name === 'calculate_total_cost') {
+    return toolCalculateTotalCost(agentContext, tripParams, args.tier || 'balanced');
+  }
+  return { error: `Unknown tool: ${name}` };
+}
+
+// ---------------------------------------------------------------------------
+// Firestore helpers
 // ---------------------------------------------------------------------------
 
 function nowIso() {
   return new Date().toISOString();
 }
 
-/**
- * Append a log entry and mirror it into history for audit/resume.
- * @param {SessionState} state
- * @param {AgentLogEntry['type']} type
- * @param {string} message
- */
 function appendLog(state, type, message) {
   const entry = { timestamp: nowIso(), type, message };
   state.logs.push(entry);
   state.history.push(entry);
 }
 
-/**
- * Persist the full session document to Firestore.
- * State transitions are always written here before responding to the client.
- *
- * @param {string} sessionId
- * @param {Partial<SessionState>} patch
- */
 async function saveSession(sessionId, patch) {
-  const ref = db.collection(SESSIONS_COLLECTION).doc(sessionId);
-  await ref.set(
-    {
-      ...patch,
-      updatedAt: FieldValue.serverTimestamp(),
-    },
+  await db.collection(SESSIONS_COLLECTION).doc(sessionId).set(
+    { ...patch, updatedAt: FieldValue.serverTimestamp() },
     { merge: true }
   );
 }
 
-/**
- * Load session or return null.
- * @param {string} sessionId
- * @returns {Promise<SessionState | null>}
- */
 async function loadSession(sessionId) {
   const snap = await db.collection(SESSIONS_COLLECTION).doc(sessionId).get();
-  if (!snap.exists) return null;
-  return /** @type {SessionState} */ (snap.data());
+  return snap.exists ? snap.data() : null;
 }
 
 // ---------------------------------------------------------------------------
-// Destination knowledge (mock travel DB — replace with real APIs in production)
+// Gemini: structured extraction
 // ---------------------------------------------------------------------------
 
-const DESTINATIONS = {
-  jaipur: {
-    name: 'Jaipur',
-    state: 'Rajasthan',
-    highlights: '3 heritage forts and the Pink City old quarter',
-    premiumAttraction: 'Amber Fort',
-    budgetAttractions: ['City Palace', 'Hawa Mahal', 'Jantar Mantar'],
-    fullAttractions: ['Amber Fort', 'Nahargarh Fort', 'Jaigarh Fort', 'Hawa Mahal'],
-    museum: 'Albert Hall Museum',
-    optional: 'Chokhi Dhani (optional)',
-    bazaar: 'Johari Bazaar',
-    conflictTemplate:
-      'Visiting all major forts (Amber, Nahargarh, Jaigarh) plus accommodation exceeds the stated budget.',
-    budgetCost: 14800,
-    fullCost: 16500,
-    autoCost: 15000,
-    overrun: 1500,
-  },
-  udaipur: {
-    name: 'Udaipur',
-    state: 'Rajasthan',
-    highlights: 'lakeside palaces and the Venice of the East',
-    premiumAttraction: 'Monsoon Palace (Sajjangarh)',
-    budgetAttractions: ['City Palace', 'Lake Pichola boat ride', 'Jagdish Temple'],
-    fullAttractions: ['City Palace', 'Lake Pichola', 'Monsoon Palace', 'Fateh Sagar Lake'],
-    museum: 'Bagore Ki Haveli',
-    optional: 'Sunset at Ambrai Ghat',
-    bazaar: 'Hathi Pol Bazaar',
-    conflictTemplate:
-      'A lake cruise plus Monsoon Palace sunset visit pushes the trip over the stated budget.',
-    budgetCost: 14200,
-    fullCost: 15800,
-    autoCost: 14500,
-    overrun: 1200,
-  },
-  goa: {
-    name: 'Goa',
-    state: 'Goa',
-    highlights: 'beaches, Portuguese heritage, and coastal cuisine',
-    premiumAttraction: 'Scuba diving at Grande Island',
-    budgetAttractions: ['Baga Beach', 'Fort Aguada', 'Anjuna flea market'],
-    fullAttractions: ['Baga Beach', 'Fort Aguada', 'Scuba diving', 'Dudhsagar Falls day trip'],
-    museum: 'Museum of Christian Art, Old Goa',
-    optional: 'Sunset cruise on Mandovi River',
-    bazaar: 'Mapusa Market',
-    conflictTemplate:
-      'Adding a Dudhsagar Falls day trip and scuba session exceeds the stated budget.',
-    budgetCost: 13500,
-    fullCost: 17200,
-    autoCost: 14000,
-    overrun: 2000,
-  },
-  manali: {
-    name: 'Manali',
-    state: 'Himachal Pradesh',
-    highlights: 'Himalayan valleys, adventure sports, and snow views',
-    premiumAttraction: 'Solang Valley paragliding',
-    budgetAttractions: ['Hadimba Temple', 'Old Manali cafés', 'Mall Road'],
-    fullAttractions: ['Solang Valley', 'Rohtang Pass', 'Hadimba Temple', 'Vashisht hot springs'],
-    museum: 'Nicholas Roerich Art Gallery',
-    optional: 'River rafting on Beas',
-    bazaar: 'Manali Market',
-    conflictTemplate:
-      'Rohtang Pass excursion plus paragliding pushes the trip beyond the stated budget.',
-    budgetCost: 14000,
-    fullCost: 16800,
-    autoCost: 14500,
-    overrun: 1800,
-  },
-};
+async function extractTripParams(userGoal) {
+  if (!genAI) throw new Error('Gemini API not configured');
 
-/** @param {string} userGoal */
-function parseBudget(userGoal) {
-  const goal = userGoal.toLowerCase();
-  const budgetMatch =
-    goal.match(/₹\s*([\d,]+)/) ||
-    goal.match(/rs\.?\s*([\d,]+)/i) ||
-    goal.match(/under\s*([\d,]+)/i);
-  return budgetMatch ? parseInt(budgetMatch[1].replace(/,/g, ''), 10) : null;
+  const response = await genAI.models.generateContent({
+    model: GEMINI_MODEL,
+    contents: `Extract trip parameters from this travel goal. Infer reasonable defaults if missing.\n\nGoal: "${userGoal}"`,
+    config: {
+      responseMimeType: 'application/json',
+      responseJsonSchema: TRIP_PARAMS_SCHEMA,
+      temperature: 0.1,
+    },
+  });
+
+  return JSON.parse(response.text);
 }
 
-/**
- * Extract destination from the user goal.
- * @param {string} userGoal
- */
-function parseDestination(userGoal) {
-  const goal = userGoal.toLowerCase();
+// ---------------------------------------------------------------------------
+// Gemini: agentic tool-calling loop
+// ---------------------------------------------------------------------------
 
-  for (const [key, dest] of Object.entries(DESTINATIONS)) {
-    if (goal.includes(key)) return { key, ...dest };
+async function runAgenticToolLoop(state, tripParams) {
+  const agentContext = {
+    transitRoute: null,
+    transitHours: 0,
+    attractions: {},
+    costBreakdown: null,
+    totalCost: 0,
+    tier: 'balanced',
+  };
+
+  const systemInstruction = `You are a travel routing agent. Plan point-to-point travel from ${tripParams.origin} to ${tripParams.destination}.
+Budget: ₹${tripParams.budget} INR. Duration: ${tripParams.durationDays} days.
+You MUST call tools in this order: get_transit_route → get_attractions (destination) → calculate_total_cost.
+Try calculate_total_cost with tier "balanced" first. Log reasoning briefly.`;
+
+  const contents = [
+    {
+      role: 'user',
+      parts: [{
+        text: `Plan transit and costs for: ${tripParams.origin} → ${tripParams.destination}, ₹${tripParams.budget}, ${tripParams.durationDays} days.`,
+      }],
+    },
+  ];
+
+  appendLog(state, 'thought', `Routing agent started: ${tripParams.origin} → ${tripParams.destination}`);
+
+  for (let step = 0; step < 8; step++) {
+    const response = await genAI.models.generateContent({
+      model: GEMINI_MODEL,
+      contents,
+      config: {
+        systemInstruction,
+        tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
+        toolConfig: {
+          functionCallingConfig: { mode: FunctionCallingConfigMode.AUTO },
+        },
+        temperature: 0.2,
+      },
+    });
+
+    if (response.text) {
+      appendLog(state, 'thought', response.text.slice(0, 300));
+    }
+
+    const calls = response.functionCalls;
+    if (!calls?.length) break;
+
+    const modelParts = calls.map((fc) => ({ functionCall: fc }));
+    contents.push({ role: 'model', parts: modelParts });
+
+    const responseParts = [];
+    for (const fc of calls) {
+      const args = fc.args || {};
+      appendLog(state, 'action', `Tool: ${fc.name}(${JSON.stringify(args)})`);
+
+      const result = executeTool(fc.name, args, agentContext, tripParams);
+      appendLog(state, 'observation', `${fc.name} → ${JSON.stringify(result).slice(0, 250)}`);
+
+      responseParts.push({
+        functionResponse: { name: fc.name, response: { output: result } },
+      });
+    }
+
+    contents.push({ role: 'user', parts: responseParts });
   }
 
-  const tripMatch = goal.match(/(?:trip to|visit|explore|go to)\s+([a-z][a-z\s]{1,20})/i);
-  if (tripMatch) {
-    const cityName = tripMatch[1].trim().replace(/\s+/g, ' ');
-    const titleCase = cityName.charAt(0).toUpperCase() + cityName.slice(1);
-    return {
-      key: 'generic',
-      name: titleCase,
-      state: 'India',
-      highlights: 'local landmarks and cultural experiences',
-      premiumAttraction: 'Premium guided heritage tour',
-      budgetAttractions: [`${titleCase} city centre`, 'Local market', 'Main cultural site'],
-      fullAttractions: [`${titleCase} city centre`, 'Premium guided heritage tour', 'Scenic viewpoint'],
-      museum: 'Local history museum',
-      optional: 'Evening food walk',
-      bazaar: 'Local bazaar',
-      conflictTemplate: `Covering all major attractions in ${titleCase} exceeds the stated budget.`,
-      budgetCost: 14000,
-      fullCost: 16000,
-      autoCost: 14500,
-      overrun: 1500,
-    };
+  if (!agentContext.costBreakdown) {
+    toolCalculateTotalCost(agentContext, tripParams, 'balanced');
   }
 
-  return { key: 'jaipur', ...DESTINATIONS.jaipur };
+  state.agentContext = agentContext;
+  state.tripParams = tripParams;
+  return agentContext;
 }
 
-/**
- * Detect whether the travel goal should trigger a budget/schedule conflict.
- * In production this would come from real tool calls (pricing APIs, calendars).
- *
- * @param {string} userGoal
- * @returns {{ trigger: boolean; reason: string }}
- */
-function detectConflict(userGoal) {
-  const goal = userGoal.toLowerCase();
-  const budget = parseBudget(userGoal);
-  const dest = parseDestination(userGoal);
-  const tightBudget = budget !== null && budget <= 15000;
+// ---------------------------------------------------------------------------
+// Conflict detection & options
+// ---------------------------------------------------------------------------
 
-  if (tightBudget) {
-    return { trigger: true, reason: dest.conflictTemplate };
+function detectAgentConflict(tripParams, agentContext) {
+  const reasons = [];
+  const budget = tripParams.budget;
+  const total = agentContext.totalCost;
+  const transitHours = agentContext.transitHours || 0;
+  const tripHours = tripParams.durationDays * 10;
+
+  if (total > budget) {
+    reasons.push(`Estimated cost ₹${total.toLocaleString('en-IN')} exceeds budget ₹${budget.toLocaleString('en-IN')}.`);
+  }
+  if (transitHours > tripHours * 0.35) {
+    reasons.push(`Transit time (${transitHours}h) consumes too much of the ${tripParams.durationDays}-day trip.`);
   }
 
-  if (goal.includes('simulate-conflict')) {
-    return { trigger: true, reason: 'Simulated schedule conflict for demonstration.' };
-  }
-
-  return { trigger: false, reason: '' };
+  return { trigger: reasons.length > 0, reason: reasons.join(' ') };
 }
 
-/**
- * Build the two-option payload presented when execution pauses.
- * @param {string} userGoal
- * @returns {PendingOption[]}
- */
-function buildConflictOptions(userGoal) {
-  const dest = parseDestination(userGoal);
-  const budget = parseBudget(userGoal);
-  const budgetLabel = budget ? budget.toLocaleString('en-IN') : '15,000';
+function buildConflictOptions(tripParams, agentContext) {
+  const budget = tripParams.budget;
+  const premium = agentContext.totalCost;
+  const budgetCost = Math.round(premium * 0.82);
+  const overrun = premium - budget;
 
   return [
     {
       id: 'option_a',
       label: 'Option A — Stay within budget',
-      description: `Keep total cost at or below ₹${budgetLabel} by skipping ${dest.premiumAttraction} and prioritizing ${dest.budgetAttractions.slice(0, 2).join(' + ')}.`,
-      metadata: { estimatedCost: budgetLabel, skipped: [dest.premiumAttraction] },
+      description: `Use budget transit tier and fewer paid activities. Target ~₹${budgetCost.toLocaleString('en-IN')} (under ₹${budget.toLocaleString('en-IN')}).`,
+      metadata: { tier: 'budget', estimatedCost: budgetCost },
     },
     {
       id: 'option_b',
-      label: 'Option B — Full experience',
-      description: `Include ${dest.premiumAttraction} and all major sights; accept a budget overrun of approximately ₹${dest.overrun.toLocaleString('en-IN')}.`,
-      metadata: { estimatedOverrun: dest.overrun, includes: dest.fullAttractions },
+      label: 'Option B — Full route experience',
+      description: `Keep ${agentContext.transitRoute?.mode || 'transit'} route and all attractions. Accept ~₹${overrun.toLocaleString('en-IN')} overrun.`,
+      metadata: { tier: 'premium', estimatedCost: premium, overrun },
     },
   ];
 }
 
-/**
- * Mock ReAct steps: Thought → Action → Observation cycles.
- * @param {SessionState} state
- */
-async function runReActSteps(state) {
-  const dest = parseDestination(state.userGoal);
-  const steps = [
-    { type: 'thought', message: `Decomposing goal: "${state.userGoal}"` },
-    { type: 'action', message: 'Searching destinations and seasonal pricing…' },
-    {
-      type: 'observation',
-      message: `Identified ${dest.name}, ${dest.state} — known for ${dest.highlights}.`,
+// ---------------------------------------------------------------------------
+// Gemini: detailed final itinerary
+// ---------------------------------------------------------------------------
+
+async function generateDetailedItinerary(tripParams, agentContext, userChoice) {
+  const tier = userChoice === 'option_a' ? 'budget' : userChoice === 'option_b' ? 'premium' : 'balanced';
+  if (userChoice === 'option_a') toolCalculateTotalCost(agentContext, tripParams, 'budget');
+  else if (userChoice === 'option_b') toolCalculateTotalCost(agentContext, tripParams, 'premium');
+
+  const prompt = `Generate a detailed travel itinerary.
+Origin: ${tripParams.origin}
+Destination: ${tripParams.destination}
+Budget: ₹${tripParams.budget}
+Duration: ${tripParams.durationDays} days
+User choice: ${userChoice} (tier: ${tier})
+Transit data: ${JSON.stringify(agentContext.transitRoute)}
+Attractions: ${JSON.stringify(agentContext.attractions)}
+Cost breakdown: ${JSON.stringify(agentContext.costBreakdown)}
+
+Include specific transit logistics (highway names, train names, etc.), morning/afternoon/evening slots per day, local transport tips, and weather-aware packing.`;
+
+  const response = await genAI.models.generateContent({
+    model: GEMINI_MODEL,
+    contents: prompt,
+    config: {
+      responseMimeType: 'application/json',
+      responseJsonSchema: FINAL_ITINERARY_SCHEMA,
+      temperature: 0.4,
+      maxOutputTokens: 4096,
     },
-    { type: 'thought', message: 'Estimating transport, lodging, and attraction costs.' },
-    { type: 'action', message: 'Querying attraction schedules and opening hours…' },
-    {
-      type: 'observation',
-      message: `${dest.premiumAttraction} requires extra time and cost; may overlap with budget constraints.`,
-    },
-  ];
+  });
 
-  for (const step of steps) {
-    appendLog(state, step.type, step.message);
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-}
-
-/**
- * Deterministic local enrichment — no API call, keeps responses polished.
- * @param {object} basePlan
- * @param {string} userChoice
- */
-function buildLocalEnrichment(basePlan, userChoice) {
-  const budgetFriendly = userChoice === 'option_a' || userChoice === 'auto';
-  return {
-    summary: budgetFriendly
-      ? `A ${basePlan.durationDays}-day ${basePlan.destination} trip tuned to stay within budget.`
-      : `A ${basePlan.durationDays}-day ${basePlan.destination} trip covering all major heritage sites.`,
-    highlights: basePlan.itinerary
-      .flatMap((d) => d.activities)
-      .filter((a) => !['Arrival', 'Departure'].includes(a))
-      .slice(0, 4),
-    packingTips: ['Comfortable walking shoes', 'Sun protection', 'Reusable water bottle'],
-  };
-}
-
-/**
- * Build the structured itinerary locally (zero LLM tokens).
- * @param {string} userGoal
- * @param {string} userChoice
- */
-function buildBasePlan(userGoal, userChoice) {
-  const dest = parseDestination(userGoal);
-  const basePlan = {
-    destination: `${dest.name}, ${dest.state}`,
-    durationDays: 3,
-    userChoice,
-    itinerary: [],
-    estimatedCostINR: 0,
-    notes: [],
-  };
-
-  if (userChoice === 'option_a') {
-    basePlan.itinerary = [
-      { day: 1, activities: ['Arrival', ...dest.budgetAttractions.slice(0, 2)] },
-      { day: 2, activities: [dest.budgetAttractions[2] || dest.bazaar, dest.bazaar, dest.optional] },
-      { day: 3, activities: [dest.museum, 'Departure'] },
-    ];
-    basePlan.estimatedCostINR = dest.budgetCost;
-    basePlan.notes.push(`${dest.premiumAttraction} omitted to honor budget cap.`);
-  } else {
-    const [a, b, c, d] = dest.fullAttractions;
-    basePlan.itinerary = [
-      { day: 1, activities: ['Arrival', a, b].filter(Boolean) },
-      { day: 2, activities: [c, d, dest.bazaar].filter(Boolean) },
-      { day: 3, activities: [dest.museum, 'Departure'] },
-    ];
-    basePlan.estimatedCostINR = userChoice === 'auto' ? dest.autoCost : dest.fullCost;
-    basePlan.notes.push(
-      userChoice === 'auto'
-        ? `Balanced ${dest.name} itinerary with no conflicts detected.`
-        : `Full experience included; budget exceeded by ₹${dest.overrun.toLocaleString('en-IN')}.`
-    );
-  }
-
-  return basePlan;
-}
-
-/**
- * Returns true when the error is a quota / rate-limit response.
- * @param {Error} err
- */
-function isQuotaError(err) {
-  const msg = String(err?.message ?? err);
-  return msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
-}
-
-/**
- * Single Gemini call with cache, cooldown, and minimal token usage.
- * Only invoked from /respond — never during the ReAct loop or conflict pause.
- *
- * @param {string} userGoal
- * @param {string} userChoice
- * @param {object} basePlan
- * @returns {Promise<object | null>}
- */
-async function enrichPlanWithGemini(userGoal, userChoice, basePlan) {
-  if (!genAI || Date.now() < geminiCooldownUntil) return null;
-
-  const cacheKey = `${userGoal}|${userChoice}`;
-  if (geminiPlanCache.has(cacheKey)) {
-    return geminiPlanCache.get(cacheKey);
-  }
-
-  // Compact prompt — only essential context, strict JSON output
-  const prompt = `Goal: ${userGoal.slice(0, 120)}
-Choice: ${userChoice}
-Days: ${basePlan.durationDays}, Cost: ₹${basePlan.estimatedCostINR}
-Return JSON only: {"summary":"<1 sentence>","highlights":["..."],"packingTips":["..."]}`;
-
-  try {
-    const response = await genAI.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: prompt,
-      config: {
-        maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS,
-        temperature: 0.3,
-        responseMimeType: 'application/json',
-      },
-    });
-
-    const text = response?.text ?? '';
-    const enrichment = JSON.parse(text);
-    geminiPlanCache.set(cacheKey, enrichment);
-    return enrichment;
-  } catch (err) {
-    if (isQuotaError(err)) {
-      geminiCooldownUntil = Date.now() + GEMINI_COOLDOWN_MS;
-      console.warn(`[Gemini] Quota hit — pausing API calls for ${GEMINI_COOLDOWN_MS / 60000} min`);
-    } else {
-      console.error('[Gemini] enrichment failed:', err.message);
-    }
-    return null;
-  }
-}
-
-/**
- * Build the final travel plan. Gemini is optional and off by default on /run.
- *
- * @param {string} userGoal
- * @param {string} userChoice
- * @param {{ useGemini?: boolean }} [options]
- * @returns {Promise<object>}
- */
-async function buildFinalPlan(userGoal, userChoice, options = {}) {
-  const { useGemini = false } = options;
-  const basePlan = buildBasePlan(userGoal, userChoice);
-  const localEnrichment = buildLocalEnrichment(basePlan, userChoice);
-
-  if (!useGemini) {
-    return { ...basePlan, ...localEnrichment, generatedBy: 'local' };
-  }
-
-  const geminiEnrichment = await enrichPlanWithGemini(userGoal, userChoice, basePlan);
-  if (geminiEnrichment) {
-    return { ...basePlan, ...geminiEnrichment, generatedBy: 'gemini' };
-  }
-
-  return { ...basePlan, ...localEnrichment, generatedBy: 'local' };
+  const plan = JSON.parse(response.text);
+  return { ...plan, userChoice, generatedBy: 'gemini' };
 }
 
 // ---------------------------------------------------------------------------
-// 2. State-Managed Execution Route — POST /api/agent/run
+// Routes
 // ---------------------------------------------------------------------------
 
-/**
- * Firestore state transitions on /run:
- *
- *   NEW SESSION:
- *     (no doc) → CREATE { status: RUNNING, logs: [], history: [] }
- *
- *   RESUME (status === AWAITING_USER_INPUT):
- *     → 409 response; client must call /respond first
- *
- *   RESUME (status === COMPLETED):
- *     → 200 with existing finalPlan (idempotent read)
- *
- *   RUN ReAct loop:
- *     RUNNING → (conflict) → AWAITING_USER_INPUT + pendingOptions
- *              → (no conflict) → COMPLETED + finalPlan
- */
 app.post('/api/agent/run', async (req, res) => {
   try {
-    const { userId, sessionId, userGoal } = req.body;
+    if (!genAI) return res.status(503).json({ error: 'Gemini API not configured' });
 
+    const { userId, sessionId, userGoal } = req.body;
     if (!userId || !sessionId || !userGoal) {
-      return res.status(400).json({
-        error: 'Missing required fields: userId, sessionId, userGoal',
-      });
+      return res.status(400).json({ error: 'Missing required fields: userId, sessionId, userGoal' });
     }
 
     let state = await loadSession(sessionId);
 
-    // --- Resume or create ---------------------------------------------------
-    if (state) {
-      // Already waiting for human input — do not continue autonomously
-      if (state.status === 'AWAITING_USER_INPUT') {
-        return res.status(409).json({
-          error: 'Session is awaiting user input. Call /api/agent/respond first.',
-          sessionId,
-          status: state.status,
-          pendingOptions: state.pendingOptions,
-          conflictReason: state.conflictReason,
-        });
-      }
-
-      // Idempotent: return completed plan without re-running
-      if (state.status === 'COMPLETED') {
-        return res.status(200).json({
-          sessionId,
-          status: state.status,
-          finalPlan: state.finalPlan,
-          logs: state.logs,
-          resumed: true,
-        });
-      }
-
-      // Resume RUNNING or ERROR sessions — append a resume marker
-      appendLog(state, 'system', `Resuming session for userId=${userId}`);
-      state.userGoal = userGoal;
-      state.status = 'RUNNING';
-    } else {
-      // CREATE: brand-new session document
-      state = {
-        sessionId,
-        userId,
-        userGoal,
-        status: 'RUNNING',
-        logs: [],
-        history: [],
-        pendingOptions: null,
-        conflictReason: null,
-        finalPlan: null,
-        createdAt: FieldValue.serverTimestamp(),
-        updatedAt: FieldValue.serverTimestamp(),
-      };
-      appendLog(state, 'system', `New session created for goal: "${userGoal}"`);
-    }
-
-    await saveSession(sessionId, state);
-
-    // --- ReAct mock execution loop ------------------------------------------
-    await runReActSteps(state);
-
-    const { trigger, reason } = detectConflict(userGoal);
-
-    // --- Option interruption (key conditional) ------------------------------
-    if (trigger) {
-      const options = buildConflictOptions(userGoal);
-
-      appendLog(
-        state,
-        'observation',
-        `Conflict detected: ${reason}. Pausing for user decision.`
-      );
-
-      /**
-       * STATE TRANSITION: RUNNING → AWAITING_USER_INPUT
-       * We persist pendingOptions and halt — no further autonomous steps run.
-       */
-      state.status = 'AWAITING_USER_INPUT';
-      state.pendingOptions = options;
-      state.conflictReason = reason;
-
-      await saveSession(sessionId, state);
-
-      // Instant response — execution pauses here
-      return res.status(200).json({
-        sessionId,
-        status: state.status,
-        conflictReason: reason,
-        pendingOptions: options,
-        logs: state.logs,
-        message: 'Agent paused. Please select an option via /api/agent/respond.',
+    if (state?.status === 'AWAITING_USER_INPUT') {
+      return res.status(409).json({
+        error: 'Session awaiting user input. Call /api/agent/respond first.',
+        sessionId, status: state.status,
+        pendingOptions: state.pendingOptions, conflictReason: state.conflictReason,
       });
     }
 
-    // No conflict: complete locally — skip Gemini to save quota
-    const finalPlan = await buildFinalPlan(userGoal, 'auto', { useGemini: false });
+    if (state?.status === 'COMPLETED') {
+      return res.status(200).json({
+        sessionId, status: state.status, finalPlan: state.finalPlan, logs: state.logs, resumed: true,
+      });
+    }
 
-    appendLog(state, 'observation', 'No conflicts found. Itinerary optimized.');
+    state = state || {
+      sessionId, userId, userGoal, status: 'RUNNING',
+      logs: [], history: [], pendingOptions: null, conflictReason: null,
+      finalPlan: null, tripParams: null, agentContext: null,
+      createdAt: FieldValue.serverTimestamp(),
+    };
 
-    /**
-     * STATE TRANSITION: RUNNING → COMPLETED
-     */
+    state.userGoal = userGoal;
+    state.status = 'RUNNING';
+    appendLog(state, 'system', `Session started: "${userGoal}"`);
+
+    // Step 1: Gemini structured extraction
+    appendLog(state, 'action', 'Extracting trip parameters via Gemini JSON schema…');
+    const tripParams = await extractTripParams(userGoal);
+    state.tripParams = tripParams;
+    appendLog(state, 'observation', `${tripParams.origin} → ${tripParams.destination} | ₹${tripParams.budget} | ${tripParams.durationDays} days`);
+
+    await saveSession(sessionId, state);
+
+    // Step 2: Agentic tool-calling loop
+    const agentContext = await runAgenticToolLoop(state, tripParams);
+
+    // Step 3: Conflict check
+    const { trigger, reason } = detectAgentConflict(tripParams, agentContext);
+
+    if (trigger) {
+      const options = buildConflictOptions(tripParams, agentContext);
+      appendLog(state, 'observation', `Conflict: ${reason} — awaiting user input.`);
+
+      state.status = 'AWAITING_USER_INPUT';
+      state.pendingOptions = options;
+      state.conflictReason = reason;
+      state.agentContext = agentContext;
+
+      await saveSession(sessionId, state);
+
+      return res.status(200).json({
+        sessionId, status: state.status, tripParams,
+        conflictReason: reason, pendingOptions: options, logs: state.logs,
+        agentContext: { transitRoute: agentContext.transitRoute, costBreakdown: agentContext.costBreakdown },
+        message: 'Agent paused. Select an option via /api/agent/respond.',
+      });
+    }
+
+    // No conflict — generate full itinerary immediately
+    appendLog(state, 'action', 'No conflicts. Generating detailed itinerary…');
+    const finalPlan = await generateDetailedItinerary(tripParams, agentContext, 'auto');
+    appendLog(state, 'observation', 'Itinerary complete.');
+
     state.status = 'COMPLETED';
     state.finalPlan = finalPlan;
-    state.pendingOptions = null;
+    state.agentContext = agentContext;
 
     await saveSession(sessionId, state);
 
     return res.status(200).json({
-      sessionId,
-      status: state.status,
-      finalPlan,
-      logs: state.logs,
+      sessionId, status: state.status, tripParams, finalPlan, logs: state.logs,
     });
   } catch (err) {
     console.error('[/api/agent/run]', err);
@@ -619,73 +547,43 @@ app.post('/api/agent/run', async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// 4. User Choice Feedback Route — POST /api/agent/respond
-// ---------------------------------------------------------------------------
-
-/**
- * Firestore state transitions on /respond:
- *
- *   AWAITING_USER_INPUT → (record userChoice in logs)
- *                       → RUNNING (brief, while finishing plan)
- *                       → COMPLETED + finalPlan
- */
 app.post('/api/agent/respond', async (req, res) => {
   try {
-    const { sessionId, userChoice } = req.body;
+    if (!genAI) return res.status(503).json({ error: 'Gemini API not configured' });
 
+    const { sessionId, userChoice } = req.body;
     if (!sessionId || !userChoice) {
-      return res.status(400).json({
-        error: 'Missing required fields: sessionId, userChoice',
-      });
+      return res.status(400).json({ error: 'Missing required fields: sessionId, userChoice' });
     }
 
     const state = await loadSession(sessionId);
-
-    if (!state) {
-      return res.status(404).json({ error: `Session "${sessionId}" not found` });
-    }
+    if (!state) return res.status(404).json({ error: `Session "${sessionId}" not found` });
 
     if (state.status !== 'AWAITING_USER_INPUT') {
       return res.status(409).json({
-        error: `Session is not awaiting input (current status: ${state.status})`,
-        sessionId,
-        status: state.status,
+        error: `Session not awaiting input (status: ${state.status})`,
+        sessionId, status: state.status,
       });
     }
 
     const validIds = (state.pendingOptions ?? []).map((o) => o.id);
     if (validIds.length && !validIds.includes(userChoice)) {
-      return res.status(400).json({
-        error: `Invalid userChoice. Expected one of: ${validIds.join(', ')}`,
-      });
+      return res.status(400).json({ error: `Invalid userChoice. Expected: ${validIds.join(', ')}` });
     }
 
-    // Record human feedback in logs / history
     const selected = state.pendingOptions?.find((o) => o.id === userChoice);
-    appendLog(
-      state,
-      'user_input',
-      `User selected: ${selected?.label ?? userChoice}`
-    );
+    appendLog(state, 'user_input', `Selected: ${selected?.label ?? userChoice}`);
 
-    /**
-     * STATE TRANSITION: AWAITING_USER_INPUT → RUNNING
-     * Signals the agent is actively completing the plan with the chosen branch.
-     */
     state.status = 'RUNNING';
     state.pendingOptions = null;
-
     await saveSession(sessionId, state);
 
-    // Single Gemini call per session — only after the user picks an option
-    const finalPlan = await buildFinalPlan(state.userGoal, userChoice, { useGemini: true });
+    appendLog(state, 'action', 'Generating detailed itinerary from user choice…');
+    const finalPlan = await generateDetailedItinerary(
+      state.tripParams, state.agentContext, userChoice
+    );
+    appendLog(state, 'observation', 'Final plan ready.');
 
-    appendLog(state, 'observation', 'Final itinerary generated from user choice.');
-
-    /**
-     * STATE TRANSITION: RUNNING → COMPLETED
-     */
     state.status = 'COMPLETED';
     state.finalPlan = finalPlan;
     state.conflictReason = null;
@@ -693,11 +591,7 @@ app.post('/api/agent/respond', async (req, res) => {
     await saveSession(sessionId, state);
 
     return res.status(200).json({
-      sessionId,
-      status: state.status,
-      userChoice,
-      finalPlan,
-      logs: state.logs,
+      sessionId, status: state.status, userChoice, finalPlan, logs: state.logs,
     });
   } catch (err) {
     console.error('[/api/agent/respond]', err);
@@ -705,12 +599,8 @@ app.post('/api/agent/respond', async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// Health check (useful for Cloud Functions / load balancers)
-// ---------------------------------------------------------------------------
-
-app.get('/health', async (_req, res) => {
-  res.status(200).json({ ok: true, timestamp: nowIso() });
+app.get('/health', (_req, res) => {
+  res.status(200).json({ ok: true, timestamp: nowIso(), gemini: !!genAI });
 });
 
 module.exports = app;
