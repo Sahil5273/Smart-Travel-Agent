@@ -199,18 +199,88 @@ node docs/generate-pdf.js
 
 ---
 
-## Deployment (Firebase Cloud Functions)
+## Firebase Deployment
 
-`server.js` exports the Express app for Cloud Functions:
+The project is configured for **Firebase Hosting** (React) + **Cloud Functions** (Express API) + **Firestore**.
 
-```javascript
-module.exports = app;
+### Prerequisites
+
+- [Firebase CLI](https://firebase.google.com/docs/cli) installed
+- Firebase project on the **Blaze (pay-as-you-go)** plan (required for Cloud Functions)
+- Logged in: `firebase login`
+- Firestore enabled in your Firebase project
+
+### 1. Link your Firebase project
+
+The repo is linked to Firebase project **`smart-travel-agent-92559`**.
+
+To use a different project:
+
+```bash
+firebase use --add
 ```
 
-1. Wrap with `functions.https.onRequest(app)`
-2. Deploy backend to Cloud Functions
-3. Build and deploy React to Firebase Hosting
-4. Set `GEMINI_API_KEY` as a Firebase secret
+Or edit `.firebaserc` with your project ID.
+
+### 2. Set the Gemini API secret
+
+Cloud Functions reads the Gemini key from Firebase Secrets (not `.env`):
+
+```bash
+firebase functions:secrets:set GEMINI_API_KEY
+# Paste your Gemini API key when prompted
+```
+
+### 3. Install dependencies
+
+```bash
+npm install
+cd functions && npm install && cd ..
+cd client && npm install && cd ..
+```
+
+### 4. Deploy everything
+
+```bash
+npm run deploy
+```
+
+This builds the React app and deploys Hosting + Functions + Firestore rules.
+
+### Deploy individually
+
+```bash
+npm run deploy:hosting     # React frontend only
+npm run deploy:functions   # Express API only
+npm run deploy:firestore   # Firestore rules only
+```
+
+### Live URLs after deploy
+
+| Service | URL |
+|---------|-----|
+| **App** | `https://<project-id>.web.app` |
+| **API** | `https://<region>-<project-id>.cloudfunctions.net/api` |
+| **Health** | `https://<project-id>.web.app/health` |
+
+Hosting rewrites `/api/**` and `/health` to the Cloud Function automatically.
+
+### Local vs production credentials
+
+| Environment | Firebase credentials |
+|-------------|-------------------|
+| **Local** (`npm start`) | `serviceAccount.json` + `.env` |
+| **Cloud Functions** | Auto-injected — no service account file needed |
+
+### Project layout for Firebase
+
+```
+functions/
+  index.js    → exports Cloud Function "api"
+  app.js      → Express app (shared logic)
+firebase.json → Hosting + Functions + Firestore config
+.firebaserc   → Firebase project ID
+```
 
 ---
 

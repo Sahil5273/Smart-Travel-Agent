@@ -1,0 +1,10 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Portfolio / demo rules — tighten before production
+    match /sessions/{sessionId} {
+      allow read, write: if true;
+    }
+  }
+}

@@ -4,13 +4,20 @@
   "description": "Human-in-the-loop travel planning agent with React, Express, Firestore, and Gemini",
   "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "start": "node server.js",
+    "build:client": "npm run build --prefix client",
+    "deploy": "npm run build:client && firebase deploy",
+    "deploy:hosting": "npm run build:client && firebase deploy --only hosting",
+    "deploy:functions": "firebase deploy --only functions",
+    "deploy:firestore": "firebase deploy --only firestore"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
+  "devDependencies": {
+    "firebase-tools": "^14.0.0"
+  },
   "dependencies": {
     "@google/genai": "^2.11.0",
     "cors": "^2.8.6",
