@@ -30,9 +30,10 @@ function TravelRoutingCard({ plan, tripParams }) {
       <div className="routing-header">
         <span className="routing-icon">🛤️</span>
         <div>
-          <h3>Travel & Routing</h3>
+          <h3>Recommended Route</h3>
           <p className="routing-route">
             {plan.origin || tripParams?.origin} → {plan.destination || tripParams?.destination}
+            {plan.distanceKm ? ` · ${plan.distanceKm} km` : ''}
           </p>
         </div>
       </div>
@@ -47,10 +48,6 @@ function TravelRoutingCard({ plan, tripParams }) {
           <span className="stat-value">{t.route}</span>
         </div>
         <div className="routing-stat">
-          <span className="stat-label">Distance</span>
-          <span className="stat-value">{t.distanceKm} km</span>
-        </div>
-        <div className="routing-stat">
           <span className="stat-label">Transit time</span>
           <span className="stat-value">{t.durationHours}h</span>
         </div>
@@ -62,6 +59,146 @@ function TravelRoutingCard({ plan, tripParams }) {
 
       <p className="routing-details">{t.details}</p>
     </div>
+  );
+}
+
+function TransitOptionsGrid({ options, costByMode, budget }) {
+  if (!options?.length) return null;
+
+  return (
+    <div className="transit-options-section">
+      <h3>Compare Transit Options</h3>
+      <div className="transit-options-grid">
+        {options.map((opt) => {
+          const costs = costByMode?.find((c) => c.mode === opt.mode);
+          const withinBudget = costs?.withinBudget ?? costs?.total <= budget;
+          return (
+            <div
+              key={opt.mode}
+              className={`transit-option-card${opt.recommended ? ' recommended' : ''}`}
+            >
+              {opt.recommended && <span className="recommended-badge">Recommended</span>}
+              <div className="transit-option-header">
+                <span className="transit-option-icon">{opt.icon}</span>
+                <strong>{opt.mode}</strong>
+              </div>
+              <p className="transit-option-route">{opt.route}</p>
+              <div className="transit-option-stats">
+                <span>{opt.durationHours}h</span>
+                <span>Transit: {formatCost(opt.estimatedCostINR)}</span>
+                {costs && <span className="total-cost">Total trip: {formatCost(costs.total)}</span>}
+              </div>
+              {budget && costs && (
+                <span className={`budget-tag${withinBudget ? ' ok' : ' over'}`}>
+                  {withinBudget ? 'Within budget' : 'Over budget'}
+                </span>
+              )}
+              <p className="transit-option-details">{opt.details}</p>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function CostBreakdownCard({ costBreakdown, costByMode }) {
+  if (!costBreakdown && !costByMode?.length) return null;
+
+  return (
+    <div className="cost-section">
+      <h3>Cost Breakdown</h3>
+
+      {costBreakdown && (
+        <div className="cost-breakdown-grid">
+          <div className="cost-row">
+            <span>Transit</span>
+            <span>{formatCost(costBreakdown.transit)}</span>
+          </div>
+          <div className="cost-row">
+            <span>Lodging ({costBreakdown.tier || 'balanced'})</span>
+            <span>{formatCost(costBreakdown.lodging)}</span>
+          </div>
+          <div className="cost-row">
+            <span>Food</span>
+            <span>{formatCost(costBreakdown.food)}</span>
+          </div>
+          <div className="cost-row">
+            <span>Activities</span>
+            <span>{formatCost(costBreakdown.activities)}</span>
+          </div>
+          <div className="cost-row total">
+            <span>Total (recommended route)</span>
+            <span>{formatCost(costBreakdown.total)}</span>
+          </div>
+        </div>
+      )}
+
+      {costByMode?.length > 0 && (
+        <div className="cost-by-mode-table">
+          <h4>Total by transit mode</h4>
+          <table>
+            <thead>
+              <tr>
+                <th>Mode</th>
+                <th>Transit</th>
+                <th>Lodging</th>
+                <th>Food</th>
+                <th>Activities</th>
+                <th>Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {costByMode.map((row) => (
+                <tr key={row.mode} className={row.recommended ? 'recommended-row' : ''}>
+                  <td>{row.icon} {row.mode}</td>
+                  <td>{formatCost(row.transit)}</td>
+                  <td>{formatCost(row.lodging)}</td>
+                  <td>{formatCost(row.food)}</td>
+                  <td>{formatCost(row.activities)}</td>
+                  <td><strong>{formatCost(row.total)}</strong></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AttractionsGrid({ destination, attractions }) {
+  if (!attractions?.length) return null;
+
+  return (
+    <div className="attractions-section">
+      <h3>Top Places in {destination}</h3>
+      <div className="attractions-grid">
+        {attractions.map((place) => (
+          <div key={place} className="attraction-chip">
+            <span className="attraction-icon">📍</span>
+            {place}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function PlanDetails({ plan, tripParams }) {
+  if (!plan) return null;
+
+  return (
+    <>
+      <TravelRoutingCard plan={plan} tripParams={tripParams} />
+      <TransitOptionsGrid
+        options={plan.transitOptions}
+        costByMode={plan.costByMode}
+        budget={tripParams?.budget}
+      />
+      <CostBreakdownCard costBreakdown={plan.costBreakdown} costByMode={plan.costByMode} />
+      <AttractionsGrid destination={plan.destination} attractions={plan.attractions} />
+    </>
   );
 }
 
@@ -88,6 +225,7 @@ export default function AgentDashboard() {
   const [conflictReason, setConflictReason] = useState('');
   const [pendingOptions, setPendingOptions] = useState([]);
   const [finalPlan, setFinalPlan] = useState(null);
+  const [agentPreview, setAgentPreview] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -96,6 +234,7 @@ export default function AgentDashboard() {
     setLoading(true);
     setError('');
     setFinalPlan(null);
+    setAgentPreview(null);
     setPendingOptions([]);
     setConflictReason('');
     setTripParams(null);
@@ -118,8 +257,10 @@ export default function AgentDashboard() {
       if (data.status === 'AWAITING_USER_INPUT') {
         setConflictReason(data.conflictReason || '');
         setPendingOptions(data.pendingOptions || []);
+        if (data.agentPreview) setAgentPreview(data.agentPreview);
       } else if (data.status === 'COMPLETED') {
         setFinalPlan(data.finalPlan);
+        setAgentPreview(null);
       }
     } catch (err) {
       setError(err.message);
@@ -140,6 +281,7 @@ export default function AgentDashboard() {
       setLogs(data.logs || []);
       setPendingOptions([]);
       setFinalPlan(data.finalPlan);
+      setAgentPreview(null);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -212,6 +354,25 @@ export default function AgentDashboard() {
             </div>
           )}
 
+          {status === 'AWAITING_USER_INPUT' && agentPreview && (
+            <div className="preview-section">
+              <h2>Route & Cost Preview</h2>
+              <PlanDetails
+                plan={{
+                  origin: tripParams?.origin,
+                  destination: tripParams?.destination,
+                  distanceKm: agentPreview.distanceKm,
+                  transitLogistics: agentPreview.transitRoute,
+                  transitOptions: agentPreview.transitOptions,
+                  costBreakdown: agentPreview.costBreakdown,
+                  costByMode: agentPreview.costByMode,
+                  attractions: agentPreview.attractions,
+                }}
+                tripParams={tripParams}
+              />
+            </div>
+          )}
+
           {status === 'AWAITING_USER_INPUT' && pendingOptions.length > 0 && (
             <div className="options-section">
               <h2>Decision Required</h2>
@@ -243,8 +404,11 @@ export default function AgentDashboard() {
                 <span>{formatCost(finalPlan.estimatedCostINR)}</span>
                 <span className="plan-source">via {finalPlan.generatedBy}</span>
               </div>
+              {finalPlan.generatedBy === 'local' && finalPlan.geminiFallbackReason && (
+                <p className="plan-fallback-note">{finalPlan.geminiFallbackReason}</p>
+              )}
 
-              <TravelRoutingCard plan={finalPlan} tripParams={tripParams} />
+              <PlanDetails plan={finalPlan} tripParams={tripParams} />
 
               <div className="daily-itinerary">
                 <h3>Day-by-Day Breakdown</h3>

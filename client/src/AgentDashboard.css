@@ -184,6 +184,199 @@
   border-top: 1px solid var(--border);
 }
 
+/* Transit options comparison */
+.transit-options-section,
+.cost-section,
+.attractions-section,
+.preview-section {
+  margin-bottom: 1.5rem;
+}
+
+.transit-options-section h3,
+.cost-section h3,
+.attractions-section h3,
+.preview-section h2 {
+  font-size: 0.9rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin-bottom: 0.85rem;
+}
+
+.transit-options-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.75rem;
+}
+
+@media (max-width: 900px) {
+  .transit-options-grid { grid-template-columns: 1fr; }
+}
+
+.transit-option-card {
+  position: relative;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem;
+}
+
+.transit-option-card.recommended {
+  border-color: rgba(59, 158, 255, 0.5);
+  background: rgba(59, 158, 255, 0.06);
+}
+
+.recommended-badge {
+  position: absolute;
+  top: 0.6rem;
+  right: 0.6rem;
+  font-size: 0.6rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+  background: rgba(59, 158, 255, 0.15);
+  padding: 0.2rem 0.45rem;
+  border-radius: 4px;
+}
+
+.transit-option-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.4rem;
+}
+
+.transit-option-icon { font-size: 1.4rem; }
+
+.transit-option-route {
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin: 0 0 0.6rem;
+  line-height: 1.4;
+}
+
+.transit-option-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.82rem;
+  margin-bottom: 0.5rem;
+}
+
+.transit-option-stats .total-cost {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.budget-tag {
+  display: inline-block;
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+  margin-bottom: 0.5rem;
+}
+
+.budget-tag.ok {
+  background: rgba(74, 222, 128, 0.15);
+  color: var(--success);
+}
+
+.budget-tag.over {
+  background: rgba(248, 113, 113, 0.15);
+  color: var(--error);
+}
+
+.transit-option-details {
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin: 0;
+  line-height: 1.4;
+  border-top: 1px solid var(--border);
+  padding-top: 0.5rem;
+}
+
+/* Cost breakdown */
+.cost-breakdown-grid {
+  display: grid;
+  gap: 0.4rem;
+  margin-bottom: 1rem;
+  background: var(--surface-2);
+  border-radius: 8px;
+  padding: 0.85rem 1rem;
+}
+
+.cost-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.88rem;
+  color: var(--text);
+}
+
+.cost-row.total {
+  border-top: 1px solid var(--border);
+  margin-top: 0.35rem;
+  padding-top: 0.5rem;
+  font-weight: 700;
+}
+
+.cost-by-mode-table h4 {
+  font-size: 0.78rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 0.5rem;
+}
+
+.cost-by-mode-table {
+  overflow-x: auto;
+}
+
+.cost-by-mode-table table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+
+.cost-by-mode-table th,
+.cost-by-mode-table td {
+  padding: 0.5rem 0.6rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+.cost-by-mode-table th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+}
+
+.cost-by-mode-table tr.recommended-row {
+  background: rgba(59, 158, 255, 0.06);
+}
+
+/* Attractions */
+.attractions-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.5rem;
+}
+
+.attraction-chip {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.55rem 0.75rem;
+  font-size: 0.85rem;
+}
+
+.attraction-icon { font-size: 0.9rem; }
+
 /* Day breakdown */
 .daily-itinerary h3 {
   font-size: 0.9rem;
@@ -263,6 +456,16 @@
 .plan-meta { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1.25rem; }
 .plan-meta span { font-size: 0.8rem; background: var(--surface-2); padding: 0.3rem 0.65rem; border-radius: 6px; color: var(--muted); }
 .plan-source { color: var(--accent) !important; }
+.plan-fallback-note {
+  margin: 0.75rem 0 0;
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  background: rgba(255, 193, 7, 0.12);
+  border: 1px solid rgba(255, 193, 7, 0.35);
+  color: #b8860b;
+  font-size: 0.9rem;
+  line-height: 1.4;
+}
 
 .extras { margin-bottom: 1rem; }
 .extras h4 { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 0.4rem; }

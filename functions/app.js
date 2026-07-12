@@ -18,8 +18,24 @@ if (!getApps().length) initializeApp();
 const db = getFirestore();
 
 const GEMINI_ENABLED = process.env.GEMINI_ENABLED !== 'false';
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash-lite';
+const MAX_AGENT_LOOP_ITERATIONS = 5;
+const QUOTA_RETRY_MESSAGE = 'Agent is thinking too fast, please wait 15 seconds and try again.';
 const SESSIONS_COLLECTION = 'sessions';
+
+function getGeminiKeyInfo() {
+  const key = process.env.GEMINI_API_KEY || '';
+  if (!key) return { configured: false, format: 'missing', hint: 'Set GEMINI_API_KEY in Firebase secrets or .env' };
+  if (key.startsWith('AQ.')) return { configured: true, format: 'auth_key', hint: null };
+  if (key.startsWith('AIza')) {
+    return {
+      configured: true,
+      format: 'standard_key',
+      hint: 'Legacy AIza keys are being phased out. Create a new auth key (AQ.) in Google AI Studio.',
+    };
+  }
+  return { configured: true, format: 'unknown', hint: 'Use a Google AI Studio API key (AQ. or AIza format).' };
+}
 
 const genAI =
   GEMINI_ENABLED && process.env.GEMINI_API_KEY
@@ -144,14 +160,54 @@ const CITY_COORDS = {
 };
 
 const ATTRACTIONS_DB = {
-  jaipur: ['Amber Fort', 'City Palace', 'Hawa Mahal', 'Jantar Mantar', 'Nahargarh Fort'],
-  udaipur: ['City Palace', 'Lake Pichola', 'Jagdish Temple', 'Monsoon Palace', 'Fateh Sagar'],
-  delhi: ['Red Fort', 'India Gate', 'Qutub Minar', 'Humayun Tomb', 'Chandni Chowk'],
-  mumbai: ['Gateway of India', 'Marine Drive', 'Elephanta Caves', 'Colaba Causeway'],
-  goa: ['Baga Beach', 'Fort Aguada', 'Basilica of Bom Jesus', 'Dudhsagar Falls'],
-  manali: ['Solang Valley', 'Hadimba Temple', 'Rohtang Pass', 'Old Manali'],
-  agra: ['Taj Mahal', 'Agra Fort', 'Mehtab Bagh'],
-  bangalore: ['Lalbagh', 'Cubbon Park', 'Bangalore Palace', 'ISKCON Temple'],
+  jaipur: [
+    'Amber Fort', 'City Palace', 'Hawa Mahal', 'Jantar Mantar', 'Nahargarh Fort',
+    'Albert Hall Museum', 'Jal Mahal', 'Birla Mandir', 'Chokhi Dhani', 'Jaigarh Fort',
+  ],
+  udaipur: [
+    'City Palace', 'Lake Pichola', 'Jagdish Temple', 'Monsoon Palace', 'Fateh Sagar Lake',
+    'Saheliyon-ki-Bari', 'Bagore Ki Haveli', 'Sajjangarh Biological Park', 'Vintage Car Museum',
+  ],
+  delhi: [
+    'Red Fort', 'India Gate', 'Qutub Minar', 'Humayun\'s Tomb', 'Chandni Chowk',
+    'Lotus Temple', 'Akshardham', 'Lodhi Garden', 'National Museum', 'Connaught Place',
+  ],
+  mumbai: [
+    'Gateway of India', 'Marine Drive', 'Elephanta Caves', 'Colaba Causeway',
+    'Chhatrapati Shivaji Terminus', 'Haji Ali Dargah', 'Sanjay Gandhi National Park', 'Juhu Beach',
+  ],
+  goa: [
+    'Baga Beach', 'Fort Aguada', 'Basilica of Bom Jesus', 'Dudhsagar Falls',
+    'Calangute Beach', 'Anjuna Flea Market', 'Chapora Fort', 'Spice Plantations',
+  ],
+  manali: [
+    'Solang Valley', 'Hadimba Temple', 'Rohtang Pass', 'Old Manali',
+    'Vashisht Hot Springs', 'Manu Temple', 'Naggar Castle', 'Beas River Trail',
+  ],
+  agra: [
+    'Taj Mahal', 'Agra Fort', 'Mehtab Bagh', 'Fatehpur Sikri',
+    'Itimad-ud-Daulah', 'Akbar\'s Tomb', 'Jama Masjid', 'Kinari Bazaar',
+  ],
+  bangalore: [
+    'Lalbagh Botanical Garden', 'Cubbon Park', 'Bangalore Palace', 'ISKCON Temple',
+    'Tipu Sultan\'s Summer Palace', 'Nandi Hills', 'UB City', 'Commercial Street',
+  ],
+  chennai: [
+    'Marina Beach', 'Kapaleeshwarar Temple', 'Fort St. George', 'San Thome Basilica',
+    'Government Museum', 'Mahabalipuram Shore Temple', 'Valluvar Kottam', 'Phoenix Marketcity',
+  ],
+  kolkata: [
+    'Victoria Memorial', 'Howrah Bridge', 'Dakshineswar Kali Temple', 'Indian Museum',
+    'Park Street', 'Science City', 'Marble Palace', 'Kumartuli',
+  ],
+  hyderabad: [
+    'Charminar', 'Golconda Fort', 'Ramoji Film City', 'Hussain Sagar Lake',
+    'Salar Jung Museum', 'Chowmahalla Palace', 'Birla Mandir', 'Laad Bazaar',
+  ],
+  amritsar: [
+    'Golden Temple', 'Wagah Border', 'Jallianwala Bagh', 'Partition Museum',
+    'Gobindgarh Fort', 'Hall Bazaar', 'Durgiana Temple', 'Pul Kanjari',
+  ],
 };
 
 function normalizeCity(name) {
@@ -180,31 +236,55 @@ function estimateDistanceKm(origin, destination) {
   return 450;
 }
 
-function toolGetTransitRoute(origin, destination) {
+function toolGetAllTransitOptions(origin, destination) {
   const distanceKm = Math.round(estimateDistanceKm(origin, destination));
-  let mode, route, durationHours, estimatedCostINR, details;
 
-  if (distanceKm <= 350) {
-    mode = 'Road';
-    route = distanceKm > 200 ? 'NH48 / NH52 expressway corridor' : 'State highway + ring road';
-    durationHours = Math.round((distanceKm / 65) * 10) / 10;
-    estimatedCostINR = Math.round(distanceKm * 4 + 600);
-    details = `Drive or AC Volvo bus from ${origin} to ${destination} via ${route}. Approx ${distanceKm} km, ${durationHours}h.`;
-  } else if (distanceKm <= 900) {
-    mode = 'Train';
-    route = 'Vande Bharat Express / Rajdhani';
-    durationHours = Math.round((distanceKm / 85 + 2) * 10) / 10;
-    estimatedCostINR = Math.round(1800 + distanceKm * 2.2);
-    details = `Board Vande Bharat Express from ${origin} to ${destination}. Scenic rail corridor, ${durationHours}h journey.`;
-  } else {
-    mode = 'Flight';
-    route = `Direct or 1-stop flight ${origin} → ${destination}`;
-    durationHours = Math.round((2.5 + distanceKm / 600) * 10) / 10;
-    estimatedCostINR = Math.round(5000 + distanceKm * 1.8);
-    details = `Fly from ${origin} airport to ${destination} airport. Check-in 2h before departure.`;
-  }
+  const car = {
+    mode: 'Car / Road',
+    icon: '🚗',
+    route: distanceKm > 200 ? 'NH48 / NH52 expressway corridor' : 'State highway + ring road',
+    durationHours: Math.max(1, Math.round((distanceKm / 65) * 10) / 10),
+    estimatedCostINR: Math.round(distanceKm * 4 + 600),
+    details: `Self-drive or AC Volvo bus from ${origin} to ${destination}. Fuel, tolls & parking included.`,
+    recommended: distanceKm <= 350,
+  };
 
-  return { origin, destination, mode, route, distanceKm, durationHours, estimatedCostINR, details };
+  const train = {
+    mode: 'Train',
+    icon: '🚆',
+    route: 'Vande Bharat Express / Rajdhani / Shatabdi',
+    durationHours: Math.max(2, Math.round((distanceKm / 85 + 2) * 10) / 10),
+    estimatedCostINR: Math.round(1200 + distanceKm * 2.2),
+    details: `Rail from ${origin} to ${destination}. AC chair car / 2AC estimate for one person.`,
+    recommended: distanceKm > 350 && distanceKm <= 900,
+  };
+
+  const flight = {
+    mode: 'Flight',
+    icon: '✈️',
+    route: `Direct or 1-stop ${origin} → ${destination}`,
+    durationHours: Math.max(2, Math.round((2.5 + distanceKm / 600) * 10) / 10),
+    estimatedCostINR: Math.round(4500 + distanceKm * 1.8),
+    details: `Commercial flight with airport transfer. Check-in 2h before departure.`,
+    recommended: distanceKm > 900,
+  };
+
+  return { origin, destination, distanceKm, options: [car, train, flight] };
+}
+
+function toolGetTransitRoute(origin, destination) {
+  const all = toolGetAllTransitOptions(origin, destination);
+  const recommended = all.options.find((o) => o.recommended) || all.options[0];
+  return {
+    origin,
+    destination,
+    mode: recommended.mode,
+    route: recommended.route,
+    distanceKm: all.distanceKm,
+    durationHours: recommended.durationHours,
+    estimatedCostINR: recommended.estimatedCostINR,
+    details: recommended.details,
+  };
 }
 
 function toolGetAttractions(city) {
@@ -218,8 +298,8 @@ function toolGetAttractions(city) {
   return { city, attractions, count: attractions.length };
 }
 
-function toolCalculateTotalCost(agentContext, tripParams, tier = 'balanced') {
-  const transit = agentContext.transitRoute?.estimatedCostINR || 0;
+function toolCalculateTotalCost(agentContext, tripParams, tier = 'balanced', transitCostOverride) {
+  const transit = transitCostOverride ?? agentContext.transitRoute?.estimatedCostINR ?? 0;
   const mult = tier === 'budget' ? 0.75 : tier === 'premium' ? 1.35 : 1;
   const lodging = Math.round(tripParams.durationDays * 2800 * mult);
   const activities = Math.round(tripParams.durationDays * 1800 * mult);
@@ -232,12 +312,59 @@ function toolCalculateTotalCost(agentContext, tripParams, tier = 'balanced') {
   return agentContext.costBreakdown;
 }
 
+function computeCostByTransitMode(tripParams, transitOptions, tier = 'balanced') {
+  const mult = tier === 'budget' ? 0.75 : tier === 'premium' ? 1.35 : 1;
+  const lodging = Math.round(tripParams.durationDays * 2800 * mult);
+  const food = Math.round(tripParams.durationDays * 900 * mult);
+  const activities = Math.round(tripParams.durationDays * 1800 * mult);
+
+  return transitOptions.options.map((opt) => ({
+    mode: opt.mode,
+    icon: opt.icon,
+    route: opt.route,
+    durationHours: opt.durationHours,
+    transit: opt.estimatedCostINR,
+    lodging,
+    food,
+    activities,
+    total: Math.round(opt.estimatedCostINR + lodging + food + activities),
+    recommended: opt.recommended,
+    withinBudget: Math.round(opt.estimatedCostINR + lodging + food + activities) <= tripParams.budget,
+  }));
+}
+
+function getDestinationAttractions(agentContext, destination) {
+  const destKey = normalizeCity(destination);
+  return (
+    agentContext.attractions[destination] ||
+    agentContext.attractions[destKey] ||
+    toolGetAttractions(destination).attractions
+  );
+}
+
+function buildPlanDetails(tripParams, agentContext, tier = 'balanced') {
+  const transitOptions = agentContext.transitOptions || toolGetAllTransitOptions(tripParams.origin, tripParams.destination);
+  const attractions = getDestinationAttractions(agentContext, tripParams.destination);
+  const costByMode = computeCostByTransitMode(tripParams, transitOptions, tier);
+  const costBreakdown = agentContext.costBreakdown || toolCalculateTotalCost(agentContext, tripParams, tier);
+
+  return {
+    transitOptions: transitOptions.options,
+    distanceKm: transitOptions.distanceKm,
+    attractions,
+    costBreakdown,
+    costByMode,
+  };
+}
+
 function executeTool(name, args, agentContext, tripParams) {
   if (name === 'get_transit_route') {
+    const all = toolGetAllTransitOptions(args.origin, args.destination);
+    agentContext.transitOptions = all;
     const result = toolGetTransitRoute(args.origin, args.destination);
     agentContext.transitRoute = result;
     agentContext.transitHours = result.durationHours;
-    return result;
+    return { ...result, allOptions: all.options };
   }
   if (name === 'get_attractions') {
     const result = toolGetAttractions(args.city);
@@ -277,23 +404,250 @@ async function loadSession(sessionId) {
 }
 
 // ---------------------------------------------------------------------------
+// Gemini helpers — rate-limit safety
+// ---------------------------------------------------------------------------
+
+function isQuotaError(err) {
+  const msg = String(err?.message ?? err);
+  const status = err?.status || err?.statusCode;
+  return status === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED');
+}
+
+function parseGeminiErrorDetail(err) {
+  const source = err?.cause || err;
+  const raw = String(source?.message ?? source ?? err?.message ?? err);
+  try {
+    const parsed = JSON.parse(raw);
+    const message = parsed?.error?.message || raw;
+    const limitMatch = message.match(/limit:\s*(\d+)/);
+    return {
+      status: parsed?.error?.code || err?.status || err?.statusCode,
+      message: message.split('\n')[0],
+      freeTierLimit: limitMatch ? Number(limitMatch[1]) : null,
+      zeroQuota: limitMatch ? Number(limitMatch[1]) === 0 : false,
+    };
+  } catch {
+    return {
+      status: err?.status || err?.statusCode,
+      message: raw.slice(0, 200),
+      freeTierLimit: null,
+      zeroQuota: raw.includes('limit: 0'),
+    };
+  }
+}
+
+function geminiFallbackReason(err) {
+  const detail = parseGeminiErrorDetail(err);
+  if (detail.zeroQuota || detail.freeTierLimit === 0) {
+    return `Gemini free-tier quota is 0 for ${GEMINI_MODEL} on this project. Enable billing in Google AI Studio or check usage at https://ai.dev/rate-limit`;
+  }
+  if (detail.status === 429) {
+    return 'Gemini rate limit hit — using local planner until quota recovers.';
+  }
+  const keyInfo = getGeminiKeyInfo();
+  if (keyInfo.hint) return keyInfo.hint;
+  return detail.message || 'Gemini unavailable — using local planner.';
+}
+
+/** Wraps all Gemini calls; converts 429 into a typed error instead of crashing. */
+async function callGemini(params) {
+  try {
+    return await genAI.models.generateContent(params);
+  } catch (err) {
+    if (isQuotaError(err)) {
+      const quotaErr = new Error(QUOTA_RETRY_MESSAGE);
+      quotaErr.status = 429;
+      quotaErr.cause = err;
+      throw quotaErr;
+    }
+    throw err;
+  }
+}
+
+function handleRouteError(res, err, routeName) {
+  console.error(`[${routeName}]`, err);
+  const status = err.status || err.statusCode;
+
+  if (status === 429 || isQuotaError(err)) {
+    return res.status(429).json({ error: QUOTA_RETRY_MESSAGE });
+  }
+  if (status === 401 || String(err.message).includes('UNAUTHENTICATED')) {
+    return res.status(503).json({
+      error: 'Gemini API authentication failed. Verify GEMINI_API_KEY in Firebase secrets is a current Google AI Studio auth key (AQ. format).',
+    });
+  }
+  return res.status(500).json({ error: `${routeName} failed`, details: err.message });
+}
+
+// ---------------------------------------------------------------------------
+// Local fallbacks (zero Gemini calls — used when quota is exhausted)
+// ---------------------------------------------------------------------------
+
+function fallbackExtractTripParams(userGoal) {
+  const fromTo = userGoal.match(/from\s+(.+?)\s+to\s+(.+?)(?:\s+under|\s+for|\s+in|\s*$)/i);
+  const budgetMatch = userGoal.match(/(?:₹|rs\.?|under)\s*([\d,]+)/i);
+  const daysMatch = userGoal.match(/(\d+)\s*-?\s*day/i);
+
+  return {
+    origin: fromTo ? fromTo[1].trim() : 'Delhi',
+    destination: fromTo ? fromTo[2].trim().replace(/\s+under.*/i, '') : 'Jaipur',
+    budget: budgetMatch ? parseInt(budgetMatch[1].replace(/,/g, ''), 10) : 20000,
+    durationDays: daysMatch ? parseInt(daysMatch[1], 10) : 3,
+  };
+}
+
+/** Runs tools directly without Gemini — 0 API calls, same agent log format. */
+function runDeterministicToolPlan(state, tripParams) {
+  const agentContext = {
+    transitRoute: null,
+    transitHours: 0,
+    attractions: {},
+    costBreakdown: null,
+    totalCost: 0,
+    tier: 'balanced',
+  };
+
+  appendLog(state, 'thought', `Planning route: ${tripParams.origin} → ${tripParams.destination}`);
+
+  appendLog(state, 'action', `Tool: get_transit_route("${tripParams.origin}", "${tripParams.destination}")`);
+  const transit = executeTool(
+    'get_transit_route',
+    { origin: tripParams.origin, destination: tripParams.destination },
+    agentContext,
+    tripParams
+  );
+  appendLog(
+    state,
+    'observation',
+    `Transit options — Car: ₹${agentContext.transitOptions.options[0].estimatedCostINR.toLocaleString('en-IN')}, Train: ₹${agentContext.transitOptions.options[1].estimatedCostINR.toLocaleString('en-IN')}, Flight: ₹${agentContext.transitOptions.options[2].estimatedCostINR.toLocaleString('en-IN')}`
+  );
+
+  appendLog(state, 'action', `Tool: get_attractions("${tripParams.destination}")`);
+  const att = executeTool('get_attractions', { city: tripParams.destination }, agentContext, tripParams);
+  appendLog(state, 'observation', `Found ${att.count} attractions in ${att.city}`);
+
+  appendLog(state, 'action', 'Tool: calculate_total_cost("balanced")');
+  const costs = executeTool('calculate_total_cost', { tier: 'balanced' }, agentContext, tripParams);
+  appendLog(state, 'observation', `Total estimated: ₹${costs.total.toLocaleString('en-IN')}`);
+
+  state.agentContext = agentContext;
+  state.tripParams = tripParams;
+  return agentContext;
+}
+
+function buildLocalItinerary(tripParams, agentContext, userChoice, fallbackReason) {
+  const tier = userChoice === 'option_a' ? 'budget' : userChoice === 'option_b' ? 'premium' : 'balanced';
+  if (userChoice === 'option_a') toolCalculateTotalCost(agentContext, tripParams, 'budget');
+  else if (userChoice === 'option_b') toolCalculateTotalCost(agentContext, tripParams, 'premium');
+  else toolCalculateTotalCost(agentContext, tripParams, 'balanced');
+
+  const transit = agentContext.transitRoute || toolGetTransitRoute(tripParams.origin, tripParams.destination);
+  const details = buildPlanDetails(tripParams, agentContext, tier);
+  const attractions = details.attractions;
+
+  const dailyItinerary = [];
+  for (let d = 1; d <= tripParams.durationDays; d++) {
+    if (d === 1) {
+      dailyItinerary.push({
+        day: 1,
+        morning: [`Depart from ${tripParams.origin}`, `Travel via ${transit.mode}: ${transit.route}`],
+        afternoon: [`Arrive in ${tripParams.destination}`, 'Hotel check-in'],
+        evening: ['Local market walk', 'Welcome dinner'],
+      });
+    } else if (d === tripParams.durationDays) {
+      dailyItinerary.push({
+        day: d,
+        morning: ['Souvenir shopping', 'Pack and checkout'],
+        afternoon: [`Return journey to ${tripParams.origin}`],
+        evening: ['Arrive home'],
+      });
+    } else {
+      const attr = attractions[(d - 2) % attractions.length];
+      dailyItinerary.push({
+        day: d,
+        morning: [`Visit ${attr}`, 'Breakfast at local café'],
+        afternoon: ['Explore nearby sights', 'Rest break'],
+        evening: ['Cultural experience / local cuisine'],
+      });
+    }
+  }
+
+  return {
+    summary: `A ${tripParams.durationDays}-day ${tier} trip from ${tripParams.origin} to ${tripParams.destination} via ${transit.mode}.`,
+    origin: tripParams.origin,
+    destination: tripParams.destination,
+    estimatedCostINR: agentContext.totalCost,
+    durationDays: tripParams.durationDays,
+    transitLogistics: {
+      mode: transit.mode,
+      route: transit.route,
+      distanceKm: transit.distanceKm,
+      durationHours: transit.durationHours,
+      estimatedCostINR: transit.estimatedCostINR,
+      details: transit.details,
+    },
+    transitOptions: details.transitOptions,
+    distanceKm: details.distanceKm,
+    attractions,
+    costBreakdown: details.costBreakdown,
+    costByMode: details.costByMode,
+    dailyItinerary,
+    localTransport: [
+      'Use app-based cabs (Uber/Ola) for city commutes',
+      'Auto-rickshaws for short distances in old city areas',
+      'Consider day-pass for hop-on-hop-off buses if available',
+    ],
+    weatherPackingList: [
+      'Comfortable walking shoes',
+      'Sun protection (hat, sunscreen)',
+      'Light cotton clothing',
+      'Reusable water bottle',
+      'Light jacket for evening travel',
+    ],
+    userChoice,
+    generatedBy: 'local',
+    geminiFallbackReason: fallbackReason || 'Gemini unavailable — using local planner.',
+  };
+}
+
+function enrichPlanWithDetails(plan, tripParams, agentContext, tier = 'balanced') {
+  const details = buildPlanDetails(tripParams, agentContext, tier);
+  return {
+    ...plan,
+    transitOptions: plan.transitOptions?.length ? plan.transitOptions : details.transitOptions,
+    distanceKm: plan.distanceKm ?? details.distanceKm,
+    attractions: plan.attractions?.length ? plan.attractions : details.attractions,
+    costBreakdown: plan.costBreakdown || details.costBreakdown,
+    costByMode: plan.costByMode?.length ? plan.costByMode : details.costByMode,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Gemini: structured extraction
 // ---------------------------------------------------------------------------
 
 async function extractTripParams(userGoal) {
-  if (!genAI) throw new Error('Gemini API not configured');
+  if (!genAI) return fallbackExtractTripParams(userGoal);
 
-  const response = await genAI.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: `Extract trip parameters from this travel goal. Infer reasonable defaults if missing.\n\nGoal: "${userGoal}"`,
-    config: {
-      responseMimeType: 'application/json',
-      responseJsonSchema: TRIP_PARAMS_SCHEMA,
-      temperature: 0.1,
-    },
-  });
-
-  return JSON.parse(response.text);
+  try {
+    const response = await callGemini({
+      model: GEMINI_MODEL,
+      contents: `Extract trip parameters from this travel goal. Infer reasonable defaults if missing.\n\nGoal: "${userGoal}"`,
+      config: {
+        responseMimeType: 'application/json',
+        responseJsonSchema: TRIP_PARAMS_SCHEMA,
+        temperature: 0.1,
+      },
+    });
+    return JSON.parse(response.text);
+  } catch (err) {
+    if (isQuotaError(err)) {
+      const reason = geminiFallbackReason(err);
+      console.warn('[Gemini] Quota hit on extract — using local parser:', reason);
+      return fallbackExtractTripParams(userGoal);
+    }
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -326,8 +680,10 @@ Try calculate_total_cost with tier "balanced" first. Log reasoning briefly.`;
 
   appendLog(state, 'thought', `Routing agent started: ${tripParams.origin} → ${tripParams.destination}`);
 
-  for (let step = 0; step < 8; step++) {
-    const response = await genAI.models.generateContent({
+  let iterations = 0;
+  for (let step = 0; step < MAX_AGENT_LOOP_ITERATIONS; step++) {
+    iterations = step + 1;
+    const response = await callGemini({
       model: GEMINI_MODEL,
       contents,
       config: {
@@ -366,6 +722,10 @@ Try calculate_total_cost with tier "balanced" first. Log reasoning briefly.`;
     contents.push({ role: 'user', parts: responseParts });
   }
 
+  if (iterations === MAX_AGENT_LOOP_ITERATIONS) {
+    appendLog(state, 'observation', `Loop capped at ${MAX_AGENT_LOOP_ITERATIONS} iterations.`);
+  }
+
   if (!agentContext.costBreakdown) {
     toolCalculateTotalCost(agentContext, tripParams, 'balanced');
   }
@@ -401,21 +761,40 @@ function buildConflictOptions(tripParams, agentContext) {
   const premium = agentContext.totalCost;
   const budgetCost = Math.round(premium * 0.82);
   const overrun = premium - budget;
+  const costByMode = computeCostByTransitMode(tripParams, agentContext.transitOptions, 'balanced');
+  const cheapest = [...costByMode].sort((a, b) => a.total - b.total)[0];
+  const recommended = costByMode.find((c) => c.recommended);
 
   return [
     {
       id: 'option_a',
       label: 'Option A — Stay within budget',
-      description: `Use budget transit tier and fewer paid activities. Target ~₹${budgetCost.toLocaleString('en-IN')} (under ₹${budget.toLocaleString('en-IN')}).`,
-      metadata: { tier: 'budget', estimatedCost: budgetCost },
+      description: `Use budget tier (${cheapest.mode} ~${formatCostINR(cheapest.total)}). Cut premium activities to stay under ${formatCostINR(budget)}.`,
+      metadata: { tier: 'budget', estimatedCost: budgetCost, suggestedMode: cheapest.mode },
     },
     {
       id: 'option_b',
       label: 'Option B — Full route experience',
-      description: `Keep ${agentContext.transitRoute?.mode || 'transit'} route and all attractions. Accept ~₹${overrun.toLocaleString('en-IN')} overrun.`,
-      metadata: { tier: 'premium', estimatedCost: premium, overrun },
+      description: `Keep ${recommended?.mode || agentContext.transitRoute?.mode || 'recommended transit'} and all attractions. Total ~${formatCostINR(premium)} (+${formatCostINR(overrun)} over budget).`,
+      metadata: { tier: 'premium', estimatedCost: premium, overrun, suggestedMode: recommended?.mode },
     },
   ];
+}
+
+function formatCostINR(amount) {
+  return `₹${Number(amount).toLocaleString('en-IN')}`;
+}
+
+function serializeAgentPreview(tripParams, agentContext) {
+  const details = buildPlanDetails(tripParams, agentContext, agentContext.tier || 'balanced');
+  return {
+    transitRoute: agentContext.transitRoute,
+    transitOptions: details.transitOptions,
+    distanceKm: details.distanceKm,
+    attractions: details.attractions,
+    costBreakdown: details.costBreakdown,
+    costByMode: details.costByMode,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -426,6 +805,15 @@ async function generateDetailedItinerary(tripParams, agentContext, userChoice) {
   const tier = userChoice === 'option_a' ? 'budget' : userChoice === 'option_b' ? 'premium' : 'balanced';
   if (userChoice === 'option_a') toolCalculateTotalCost(agentContext, tripParams, 'budget');
   else if (userChoice === 'option_b') toolCalculateTotalCost(agentContext, tripParams, 'premium');
+
+  if (!genAI) {
+    return buildLocalItinerary(
+      tripParams,
+      agentContext,
+      userChoice,
+      getGeminiKeyInfo().hint || 'Gemini API key not configured.'
+    );
+  }
 
   const prompt = `Generate a detailed travel itinerary.
 Origin: ${tripParams.origin}
@@ -439,19 +827,32 @@ Cost breakdown: ${JSON.stringify(agentContext.costBreakdown)}
 
 Include specific transit logistics (highway names, train names, etc.), morning/afternoon/evening slots per day, local transport tips, and weather-aware packing.`;
 
-  const response = await genAI.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: prompt,
-    config: {
-      responseMimeType: 'application/json',
-      responseJsonSchema: FINAL_ITINERARY_SCHEMA,
-      temperature: 0.4,
-      maxOutputTokens: 4096,
-    },
-  });
-
-  const plan = JSON.parse(response.text);
-  return { ...plan, userChoice, generatedBy: 'gemini' };
+  try {
+    const response = await callGemini({
+      model: GEMINI_MODEL,
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json',
+        responseJsonSchema: FINAL_ITINERARY_SCHEMA,
+        temperature: 0.4,
+        maxOutputTokens: 4096,
+      },
+    });
+    const plan = JSON.parse(response.text);
+    return enrichPlanWithDetails(
+      { ...plan, userChoice, generatedBy: 'gemini' },
+      tripParams,
+      agentContext,
+      tier
+    );
+  } catch (err) {
+    if (isQuotaError(err)) {
+      const reason = geminiFallbackReason(err);
+      console.warn('[Gemini] Quota hit on itinerary — using local plan builder:', reason);
+      return buildLocalItinerary(tripParams, agentContext, userChoice, reason);
+    }
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -460,8 +861,6 @@ Include specific transit logistics (highway names, train names, etc.), morning/a
 
 app.post('/api/agent/run', async (req, res) => {
   try {
-    if (!genAI) return res.status(503).json({ error: 'Gemini API not configured' });
-
     const { userId, sessionId, userGoal } = req.body;
     if (!userId || !sessionId || !userGoal) {
       return res.status(400).json({ error: 'Missing required fields: userId, sessionId, userGoal' });
@@ -494,16 +893,16 @@ app.post('/api/agent/run', async (req, res) => {
     state.status = 'RUNNING';
     appendLog(state, 'system', `Session started: "${userGoal}"`);
 
-    // Step 1: Gemini structured extraction
-    appendLog(state, 'action', 'Extracting trip parameters via Gemini JSON schema…');
+    // Step 1: Extract trip params (Gemini with local fallback)
+    appendLog(state, 'action', 'Extracting trip parameters…');
     const tripParams = await extractTripParams(userGoal);
     state.tripParams = tripParams;
     appendLog(state, 'observation', `${tripParams.origin} → ${tripParams.destination} | ₹${tripParams.budget} | ${tripParams.durationDays} days`);
 
     await saveSession(sessionId, state);
 
-    // Step 2: Agentic tool-calling loop
-    const agentContext = await runAgenticToolLoop(state, tripParams);
+    // Step 2: Run tools locally (0 Gemini calls — avoids quota spam)
+    const agentContext = runDeterministicToolPlan(state, tripParams);
 
     // Step 3: Conflict check
     const { trigger, reason } = detectAgentConflict(tripParams, agentContext);
@@ -522,7 +921,7 @@ app.post('/api/agent/run', async (req, res) => {
       return res.status(200).json({
         sessionId, status: state.status, tripParams,
         conflictReason: reason, pendingOptions: options, logs: state.logs,
-        agentContext: { transitRoute: agentContext.transitRoute, costBreakdown: agentContext.costBreakdown },
+        agentPreview: serializeAgentPreview(tripParams, agentContext),
         message: 'Agent paused. Select an option via /api/agent/respond.',
       });
     }
@@ -542,15 +941,12 @@ app.post('/api/agent/run', async (req, res) => {
       sessionId, status: state.status, tripParams, finalPlan, logs: state.logs,
     });
   } catch (err) {
-    console.error('[/api/agent/run]', err);
-    return res.status(500).json({ error: 'Agent run failed', details: err.message });
+    return handleRouteError(res, err, '/api/agent/run');
   }
 });
 
 app.post('/api/agent/respond', async (req, res) => {
   try {
-    if (!genAI) return res.status(503).json({ error: 'Gemini API not configured' });
-
     const { sessionId, userChoice } = req.body;
     if (!sessionId || !userChoice) {
       return res.status(400).json({ error: 'Missing required fields: sessionId, userChoice' });
@@ -594,13 +990,38 @@ app.post('/api/agent/respond', async (req, res) => {
       sessionId, status: state.status, userChoice, finalPlan, logs: state.logs,
     });
   } catch (err) {
-    console.error('[/api/agent/respond]', err);
-    return res.status(500).json({ error: 'Agent respond failed', details: err.message });
+    return handleRouteError(res, err, '/api/agent/respond');
   }
 });
 
-app.get('/health', (_req, res) => {
-  res.status(200).json({ ok: true, timestamp: nowIso(), gemini: !!genAI });
+app.get('/health', async (_req, res) => {
+  const keyInfo = getGeminiKeyInfo();
+  const payload = {
+    ok: true,
+    timestamp: nowIso(),
+    gemini: !!genAI,
+    geminiKeyFormat: keyInfo.format,
+    geminiKeyHint: keyInfo.hint,
+    geminiModel: GEMINI_MODEL,
+  };
+
+  if (!genAI) {
+    return res.status(200).json(payload);
+  }
+
+  try {
+    await callGemini({ model: GEMINI_MODEL, contents: 'Reply with exactly: OK' });
+    return res.status(200).json({ ...payload, geminiStatus: 'ok' });
+  } catch (err) {
+    const detail = parseGeminiErrorDetail(err);
+    return res.status(200).json({
+      ...payload,
+      geminiStatus: 'fallback_only',
+      geminiError: detail.message,
+      geminiFreeTierLimit: detail.freeTierLimit,
+      geminiFallbackReason: geminiFallbackReason(err),
+    });
+  }
 });
 
 module.exports = app;

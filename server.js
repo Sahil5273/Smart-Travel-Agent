@@ -1,6 +1,6 @@
 /**
  * Local development entry point.
- * Production: Firebase Cloud Functions (functions/index.js)
+ * Agent logic + rate limits live in functions/app.js (shared with Cloud Functions).
  */
 'use strict';
 
